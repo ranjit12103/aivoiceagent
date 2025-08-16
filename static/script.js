@@ -9,7 +9,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   recordBtn.addEventListener("click", async () => {
     if (!recording) {
-      // Start recording
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         recorder = new MediaRecorder(stream);
@@ -20,17 +19,16 @@ document.addEventListener("DOMContentLoaded", () => {
         recorder.start();
         recording = true;
         recordBtn.classList.add("recording");
-        recordBtn.textContent = "⏹️"; // stop icon
+        recordBtn.textContent = "⏹️";
         statusDiv.textContent = "Recording... Tap to stop.";
       } catch {
         alert("Microphone access denied.");
       }
     } else {
-      // Stop recording
       recorder.stop();
       recording = false;
       recordBtn.classList.remove("recording");
-      recordBtn.textContent = "🎙️"; // mic icon
+      recordBtn.textContent = "🎙️";
       statusDiv.textContent = "Processing...";
     }
   });
