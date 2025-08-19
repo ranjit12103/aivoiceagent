@@ -1,190 +1,144 @@
-# main.py — Day 17: WebSocket streaming to AssemblyAI Realtime STT
-import os
-import json
-import threading
-import queue
-from typing import Optional
-
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+# main.py
+from fastapi import FastAPI, Request, UploadFile, File, Path, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from typing import Dict, List, Any
+import logging
+import asyncio
+import json
 
-from dotenv import load_dotenv
-import assemblyai as aai  # pip install assemblyai
+# Import the config file FIRST to load dotenv and configure APIs
+import app_config
+from services import stt, llm, tts, streaming_stt
+from schemas import TTSRequest
 
-load_dotenv()
+# configure logging
+logging.basicconfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-if not ASSEMBLYAI_API_KEY:
-    print("⚠ ASSEMBLYAI_API_KEY missing in environment!")
-
-# ---------- FastAPI setup ----------
 app = FastAPI()
+
+# Mount static for CSS/JS and templates for HTML
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+# In-memory store for chat histories.
+chat_histories: Dict[str, List[Dict[str, Any]]] = {}
 
-@app.get("/", response_class=HTMLResponse)
+
+@app.get("/")
 async def home(request: Request):
+    """Serves the main HTML page."""
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-# ---------- Realtime STT pipeline ----------
-class AAIRealtimeBridge:
+@app.post("/agent/chat/{session_id}")
+async def agent_chat(
+    session_id: str = Path(..., description="The unique ID for the chat session."),
+    audio_file: UploadFile = File(...)
+):
     """
-    Bridges incoming PCM16 mono 16kHz bytes to AssemblyAI RealtimeTranscriber.
-    Uses a thread to keep the AAI streaming client running while the FastAPI
-    WebSocket (async) receives audio bytes and pushes them into a Queue.
+    Handles a turn in the conversation, including history.
+    STT -> Add to History -> LLM -> Add to History -> TTS
     """
-    def __init__(self, sample_rate: int = 16000):
-        if not ASSEMBLYAI_API_KEY:
-            raise RuntimeError("ASSEMBLYAI_API_KEY not set")
+    fallback_audio_path = "static/fallback.mp3"
 
-        aai.settings.api_key = ASSEMBLYAI_API_KEY
-        self.sample_rate = sample_rate
-        self.audio_q: queue.Queue[bytes] = queue.Queue()
-        self.transcriber: Optional[aai.RealtimeTranscriber] = None
-        self.thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-
-        # Will be set by FastAPI handler to push transcripts back to client
-        self.ws_send_func = None  # callable that takes str message
-
-    def start(self):
-        def on_open(session):
-            print("✅ AAI Realtime session opened:", session)
-
-        def on_data(transcript: aai.RealtimeTranscript):
-            # transcript can be PartialTranscript or FinalTranscript
-            payload = {
-                "type": "transcript",
-                "final": transcript.type == "FinalTranscript",
-                "text": transcript.text or "",
-            }
-            # echo to console
-            tag = "FINAL" if payload["final"] else "PARTIAL"
-            print(f"[{tag}] {payload['text']}")
-            # forward to client if available
-            if self.ws_send_func:
-                try:
-                    self.ws_send_func(json.dumps(payload))
-                except Exception as e:
-                    print("WS send error:", e)
-
-        def on_error(err: aai.RealtimeError):
-            print("❌ AAI error:", err)
-            if self.ws_send_func:
-                try:
-                    self.ws_send_func(json.dumps({
-                        "type": "error",
-                        "message": str(err),
-                    }))
-                except Exception as e:
-                    print("WS send error:", e)
-
-        def on_close():
-            print("👋 AAI Realtime session closed")
-
-        def worker():
-            # Create realtime transcriber
-            self.transcriber = aai.RealtimeTranscriber(
-                sample_rate=self.sample_rate,
-                on_open=on_open,
-                on_data=on_data,
-                on_error=on_error,
-                on_close=on_close,
-            )
-
-            # Start the session
-            with self.transcriber:
-                self.transcriber.connect()
-
-                # Pump audio frames from the queue to AAI until stop
-                while not self._stop.is_set():
-                    try:
-                        chunk = self.audio_q.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if chunk is None:
-                        break
-                    # IMPORTANT: send raw PCM16 mono bytes at 16kHz
-                    self.transcriber.stream(chunk)
-
-                # Finalize/close
-                try:
-                    self.transcriber.close()
-                except Exception:
-                    pass
-
-        self.thread = threading.Thread(target=worker, daemon=True)
-        self.thread.start()
-
-    def send_audio(self, pcm_bytes: bytes):
-        if not self._stop.is_set():
-            self.audio_q.put(pcm_bytes)
-
-    def stop(self):
-        self._stop.set()
-        # Sentinel to break queue
-        self.audio_q.put(None)
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-
-
-@app.websocket("/ws/transcribe")
-async def ws_transcribe(websocket: WebSocket):
-    """
-    Client connects and streams PCM16 mono 16kHz audio frames as binary messages.
-    We forward frames to AssemblyAI Realtime and return partial/final transcripts
-    back to the client as text JSON messages.
-    """
-    await websocket.accept()
-    print("🌐 Client connected to /ws/transcribe")
-
-    # Create the bridge + start AAI streaming
-    bridge = AAIRealtimeBridge(sample_rate=16000)
-
-    # attach function to send transcripts back to this websocket
-    def ws_send(text: str):
-        # Schedule send in a thread-safe way via anyio (FastAPI handles sync OK)
-        try:
-            # Note: send_text can be awaited; here we are in a different thread
-            # but FastAPI allows calling send_text from threads; if not, we could
-            # use starlette.concurrency.run_until_first_complete patterns.
-            import asyncio
-            asyncio.run(websocket.send_text(text))
-        except RuntimeError:
-            # If already in an event loop, dispatch a task
-            import asyncio
-            loop = asyncio.get_event_loop()
-            loop.create_task(websocket.send_text(text))
-        except Exception as e:
-            print("send_text error:", e)
-
-    bridge.ws_send_func = ws_send
-    bridge.start()
+    # Check for keys by importing them from the config module
+    if not all([app_config.GEMINI_API_KEY, app_config.ASSEMBLYAI_API_KEY, app_config.MURF_API_KEY]):
+        logging.warning("One or more API keys are not configured. Returning fallback audio.")
+        return FileResponse(fallback_audio_path, media_type="audio/mpeg", headers={"X-Error": "true"})
 
     try:
+        # Step 1: Transcribe audio to text
+        user_query_text = stt.transcribe_audio(audio_file)
+        logging.info(f"User Query (session {session_id}): {user_query_text}")
+
+        # Step 2: Retrieve history and get a response from the LLM
+        session_history = chat_histories.get(session_id, [])
+        llm_response_text, updated_history = llm.get_llm_response(user_query_text, session_history)
+        logging.info(f"LLM Response (session {session_id}): {llm_response_text}")
+
+        # Step 3: Update the chat history
+        chat_histories[session_id] = updated_history
+
+        # Step 4: Convert the LLM's text response to speech
+        audio_url = tts.convert_text_to_speech(llm_response_text)
+
+        if audio_url:
+            return JSONResponse(content={"audio_url": audio_url})
+        else:
+            raise Exception("TTS service did not return an audio file.")
+
+    except Exception as e:
+        logging.error(f"An error occurred in session {session_id}: {e}")
+        return FileResponse(fallback_audio_path, media_type="audio/mpeg", headers={"X-Error": "true"})
+
+
+@app.post("/tts")
+async def tts_endpoint(request: TTSRequest):
+    """Endpoint for the simple Text-to-Speech utility."""
+    try:
+        audio_url = tts.convert_text_to_speech(request.text, request.voiceId)
+        if audio_url:
+            return JSONResponse(content={"audio_url": audio_url})
+        else:
+            return JSONResponse(status_code=500, content={"error": "No audio URL in the API response."})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"TTS generation failed: {e}"})
+
+
+@app.get("/voices")
+async def get_voices():
+    """Fetches the list of available voices from Murf AI."""
+    try:
+        voices = tts.get_available_voices()
+        return JSONResponse(content={"voices": voices})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Failed to fetch voices: {e}"})
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time audio streaming and transcription."""
+    await websocket.accept()
+    
+    # Check if AssemblyAI API key is configured
+    if not app_config.ASSEMBLYAI_API_KEY:
+        logging.error("AssemblyAI API key not configured")
+        await websocket.send_text(json.dumps({"error": "AssemblyAI API key not configured"}))
+        await websocket.close()
+        return
+    
+    # Initialize streaming transcriber
+    transcriber = None
+    
+    try:
+        # Create streaming transcriber with event handlers
+        transcriber = streaming_stt.StreamingTranscriber(
+            websocket=websocket,
+            sample_rate=16000  # 16kHz as recommended by AssemblyAI
+        )
+        
+        # Start the streaming transcription
+        await transcriber.start()
+        
+        # Handle incoming audio data
         while True:
-            # Expect binary frames of PCM16 mono @16kHz
-            message = await websocket.receive()
-            if "bytes" in message and message["bytes"] is not None:
-                bridge.send_audio(message["bytes"])
-            elif "text" in message and message["text"] is not None:
-                # allow client to send control messages if needed
-                txt = message["text"]
-                if txt == "__close__":
-                    break
-            else:
-                # ignore pings/empty
-                pass
+            try:
+                data = await websocket.receive_bytes()
+                # Send audio data to AssemblyAI for transcription
+                await transcriber.send_audio(data)
+            except WebSocketDisconnect:
+                logging.info("WebSocket connection closed by client")
+                break
+            except Exception as e:
+                logging.error(f"Error processing audio data: {e}")
+                break
+                
     except WebSocketDisconnect:
-        print("⚠ Client disconnected from /ws/transcribe")
+        logging.info("WebSocket connection closed")
+    except Exception as e:
+        logging.error(f"WebSocket error: {e}")
     finally:
-        bridge.stop()
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-        print("🔌 WebSocket closed")
+        # Clean up the streaming transcriber
+        if transcriber:
+            await transcriber.close()

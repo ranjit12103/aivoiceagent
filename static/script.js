@@ -1,153 +1,143 @@
-// static/script.js — Day 17 client: capture mic, downsample to 16kHz PCM16 mono, stream over WS
+// static/script.js
 
-let ws = null;
-let audioContext = null;
-let processor = null;
-let sourceNode = null;
-let mediaStream = null;
-
-const recordBtn = document.getElementById("recordBtn");
-const statusDiv = document.getElementById("status");
-const partialDiv = document.getElementById("partial");
-const finalDiv = document.getElementById("final");
-
-let isRecording = false;
-
-// Utility: convert Float32 -> Int16 PCM
-function floatTo16BitPCM(float32Array) {
-  const out = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    let s = Math.max(-1, Math.min(1, float32Array[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
-}
-
-// Utility: downsample buffer from srcRate -> 16kHz (mono)
-function downsampleBuffer(buffer, srcSampleRate, outSampleRate = 16000) {
-  if (outSampleRate === srcSampleRate) {
-    return buffer;
-  }
-  const sampleRateRatio = srcSampleRate / outSampleRate;
-  const newLength = Math.round(buffer.length / sampleRateRatio);
-  const result = new Float32Array(newLength);
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-    // simple averaging to reduce high-frequency aliasing
-    let accum = 0, count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-      accum += buffer[i];
-      count++;
+document.addEventListener("DOMContentLoaded", async () => {
+    // --- SESSION MANAGEMENT ---
+    const urlParams = new URLSearchParams(window.location.search);
+    let sessionId = urlParams.get('session_id');
+    if (!sessionId) {
+        sessionId = crypto.randomUUID();
+        window.history.replaceState({}, '', `?session_id=${sessionId}`);
     }
-    result[offsetResult] = accum / (count || 1);
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-  return result;
-}
 
-async function startStreaming() {
-  // 1) Open WS to server
-  ws = new WebSocket(`ws://${window.location.host}/ws/transcribe`);
-  ws.binaryType = "arraybuffer";
+    // --- WebSocket and Recording Logic ---
+    let mediaRecorder = null;
+    let isRecording = false;
+    let socket = null;
+    let audioContext = null;
+    let processor = null;
 
-  ws.onopen = () => {
-    statusDiv.textContent = "Connected. Start speaking…";
-  };
+    const recordBtn = document.getElementById("recordBtn");
+    const statusDisplay = document.getElementById("statusDisplay");
+    const transcriptionDisplay = document.getElementById("transcriptionDisplay");
 
-  ws.onmessage = (ev) => {
-    try {
-      const data = JSON.parse(ev.data);
-      if (data.type === "transcript") {
-        if (data.final) {
-          // append final line
-          const line = data.text.trim();
-          if (line) {
-            finalDiv.textContent += (finalDiv.textContent ? "\n" : "") + line;
-          }
-          partialDiv.textContent = "";
-        } else {
-          partialDiv.textContent = data.text;
+    const startRecording = async () => {
+        if (!navigator.mediaDevices?.getUserMedia) {
+            alert("Audio recording not supported in this browser.");
+            return;
         }
-      } else if (data.type === "error") {
-        statusDiv.textContent = `AssemblyAI Error: ${data.message}`;
-      }
-    } catch {
-      // non-JSON messages ignored
-    }
-  };
 
-  ws.onclose = () => {
-    statusDiv.textContent = "Disconnected.";
-  };
+        isRecording = true;
+        recordBtn.classList.add("recording");
+        statusDisplay.textContent = "Recording... Press the button to stop.";
 
-  // 2) Capture mic with Web Audio API
-  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-  sourceNode = audioContext.createMediaStreamSource(mediaStream);
+        // Establish WebSocket connection
+        const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
-  // ScriptProcessor is deprecated but simplest cross-browser approach
-  const bufferSize = 4096;
-  processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+        socket.onopen = async () => {
+            console.log("WebSocket connection established.");
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
 
-  processor.onaudioprocess = (e) => {
-    // capture mono channel 0
-    const input = e.inputBuffer.getChannelData(0);
-    // downsample to 16kHz
-    const downsampled = downsampleBuffer(input, audioContext.sampleRate, 16000);
-    // float -> int16 PCM
-    const pcm16 = floatTo16BitPCM(downsampled);
-    // send as ArrayBuffer
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(pcm16.buffer);
-    }
-  };
+                // Create AudioContext for processing audio to PCM format
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(stream);
+                
+                // Create ScriptProcessorNode for audio processing
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = (event) => {
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        const inputData = event.inputBuffer.getChannelData(0);
+                        
+                        // Convert float32 audio data to 16-bit PCM
+                        const pcmData = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            // Clamp the value to prevent distortion
+                            const sample = Math.max(-1, Math.min(1, inputData[i]));
+                            pcmData[i] = sample * 32767;
+                        }
+                        
+                        // Send PCM data as bytes
+                        socket.send(pcmData.buffer);
+                    }
+                };
+                
+                // Connect the audio processing chain
+                source.connect(processor);
+                processor.connect(audioContext.destination);
 
-  sourceNode.connect(processor);
-  processor.connect(audioContext.destination); // required in some browsers even if we don't want to hear it
-}
+            } catch (err) {
+                console.error("Error accessing mic:", err);
+                alert("Could not access microphone. Please check permissions.");
+                isRecording = false;
+                recordBtn.classList.remove("recording");
+                statusDisplay.textContent = "Ready to chat!";
+            }
+        };
 
-function stopStreaming() {
-  // Stop audio graph
-  try { processor && processor.disconnect(); } catch {}
-  try { sourceNode && sourceNode.disconnect(); } catch {}
-  try { audioContext && audioContext.close(); } catch {}
-  try { mediaStream && mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+        socket.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                
+                if (message.type === "transcription") {
+                    // Display transcription in console and UI
+                    console.log("Transcription:", message.text);
+                    
+                    if (transcriptionDisplay) {
+                        transcriptionDisplay.textContent = message.text;
+                        transcriptionDisplay.style.display = "block";
+                    }
+                } else if (message.type === "error") {
+                    console.error("Transcription error:", message.message);
+                    statusDisplay.textContent = `Error: ${message.message}`;
+                }
+            } catch (err) {
+                console.error("Error parsing WebSocket message:", err);
+            }
+        };
+        
+        socket.onclose = () => {
+            console.log("WebSocket connection closed.");
+        };
+        
+        socket.onerror = (error) => {
+            console.error("WebSocket error:", error);
+        };
+    };
 
-  // Close websocket
-  try { ws && ws.readyState === WebSocket.OPEN && ws.send("__close__"); } catch {}
-  try { ws && ws.close(); } catch {}
+    const stopRecording = () => {
+        if (processor) {
+            processor.disconnect();
+            processor = null;
+        }
+        
+        if (audioContext) {
+            audioContext.close();
+            audioContext = null;
+        }
+        
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.close();
+        }
+        
+        isRecording = false;
+        recordBtn.classList.remove("recording");
+        statusDisplay.textContent = "Recording stopped. Check console for transcriptions.";
+    };
 
-  ws = null;
-  audioContext = null;
-  processor = null;
-  sourceNode = null;
-  mediaStream = null;
-}
-
-recordBtn.addEventListener("click", async () => {
-  if (!isRecording) {
-    try {
-      isRecording = true;
-      recordBtn.classList.add("recording");
-      recordBtn.textContent = "⏹️";
-      statusDiv.textContent = "Connecting…";
-      partialDiv.textContent = "";
-      // don't clear final; we append
-      await startStreaming();
-    } catch (e) {
-      isRecording = false;
-      recordBtn.classList.remove("recording");
-      recordBtn.textContent = "🎙️";
-      statusDiv.textContent = `Error: ${e?.message || e}`;
-    }
-  } else {
-    isRecording = false;
-    recordBtn.classList.remove("recording");
-    recordBtn.textContent = "🎙️";
-    statusDiv.textContent = "Stopping…";
-    stopStreaming();
-  }
+    recordBtn.addEventListener("click", () => {
+        if (isRecording) {
+            stopRecording();
+        } else {
+            startRecording();
+        }
+    });
 });
